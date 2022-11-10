@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
-use log::info;
+use log::{info, error};
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::io::AsyncRead;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::codec::{FramedRead, LinesCodec};
+
+use crate::enclave_log::SubStreamCodec;
 
 const LOG_LINE_MAX_LEN: usize = 4 * 1024;
 
@@ -38,12 +40,15 @@ pub async fn log_lines_from_stream<S>(target: &str, stream: S) -> Result<()>
 where
     S: AsyncRead + Unpin,
 {
-    let mut framed = FramedRead::new(stream, LinesCodec::new_with_max_length(LOG_LINE_MAX_LEN));
+    let mut framed = FramedRead::new(stream, SubStreamCodec::new());
 
-    while let Some(line_res) = framed.next().await {
-        match line_res {
-            Ok(line) => info!(target: target, "{line}"),
-            Err(e) => info!(target: target, "error reading log stream: {e}"),
+    while let Some(frame_res) = framed.next().await {
+        match frame_res {
+            Ok((label, bytes)) => {
+                let line = String::from_utf8_lossy(&bytes);
+                info!(target: &label.to_string(), "{line}")
+            },
+            Err(e) => error!(target: target, "error reading log stream: {e}"),
         }
     }
 

@@ -1,15 +1,15 @@
 use std::sync::{Arc, Mutex};
-use std::os::unix::io::AsRawFd;
-use tokio_pipe::{PipeRead, PipeWrite};
+use tokio_pipe::{PipeRead};
 use circbuf::CircBuf;
 use anyhow::Result;
-use tokio::io::{AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncReadExt};
 use tokio::task::JoinHandle;
-use tokio::sync::watch::{Sender, Receiver};
+use tokio::sync::watch;
 use tokio_vsock::VsockStream;
 use futures::Stream;
+use futures::stream::FuturesUnordered;
 
-use crate::launcher::ExitStatus;
+use enclaver::enclave_log::SubStreamLabel;
 
 const APP_LOG_CAPACITY: usize = 128*1024;
 
@@ -19,7 +19,7 @@ struct LogCursor {
 
 impl LogCursor {
     fn new() -> Self {
-        return Self{
+        Self{
             pos: 0usize,
         }
     }
@@ -28,15 +28,19 @@ impl LogCursor {
 struct ByteLog {
     buffer: CircBuf,
     head: usize,
-    watches: WatchSet,
+    watch_tx: watch::Sender<()>,
+    watch_rx: watch::Receiver<()>,
 }
 
 impl ByteLog {
     fn new() -> Self {
+        let (tx, rx) = watch::channel(());
+
         Self{
             buffer: CircBuf::with_capacity(APP_LOG_CAPACITY).unwrap(),
             head: 0usize,
-            watches: WatchSet::new(),
+            watch_rx: rx,
+            watch_tx: tx,
         }
     }
 
@@ -57,7 +61,7 @@ impl ByteLog {
         assert!(self.buffer.write(data).unwrap() == data.len());
 
         // notify the watchers that an append happened
-        self.watches.notify();
+        _ = self.watch_tx.send(());
 
         trim_cnt
     }
@@ -91,149 +95,132 @@ impl ByteLog {
         copied
     }
 
-    fn watch(&mut self) -> Receiver<()> {
-        self.watches.add()
+    fn watch(&mut self) -> watch::Receiver<()> {
+        self.watch_rx.clone()
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn cap(&self) -> usize {
         self.buffer.cap()
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.buffer.len()
     }
 }
 
-struct LogWriter {
-    w_pipe: PipeWrite,
-}
-
-struct LogServicer {
-    r_pipe: PipeRead,
+struct SubStream {
     log: Arc<Mutex<ByteLog>>,
+    label: SubStreamLabel,
+    feed_task: JoinHandle<()>,
 }
 
-#[derive(Clone)]
-struct LogReader {
-    log: Arc<Mutex<ByteLog>>,
-}
+impl SubStream {
+    fn new(r_pipe: PipeRead, label: SubStreamLabel) -> Self {
+        let log = Arc::new(Mutex::new(ByteLog::new()));
 
-fn new_app_log() -> Result<(LogWriter, LogServicer, LogReader)> {
-    let (r, w) = tokio_pipe::pipe()?;
+        let log2 = log.clone();
+        let feed_task = tokio::task::spawn(async move {
+            _ = SubStream::feed_from(r_pipe, log2).await;
+        });
 
-    let log = Arc::new(Mutex::new(ByteLog::new()));
-
-    let lw = LogWriter{
-        w_pipe: w,
-    };
-
-    let ls = LogServicer {
-        r_pipe: r,
-        log: log.clone(),
-    };
-
-    let lr = LogReader{
-        log: log,
-    };
-
-    Ok((lw, ls, lr))
-}
-
-impl LogWriter {
-    fn redirect_stdio(&self) -> Result<()> {
-        nix::unistd::dup2(self.w_pipe.as_raw_fd(), std::io::stdout().as_raw_fd())?;
-        nix::unistd::dup2(self.w_pipe.as_raw_fd(), std::io::stderr().as_raw_fd())?;
-
-        Ok(())
+        Self{ log, label, feed_task }
     }
 
-    #[cfg(test)]
-    async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.w_pipe.write_all(data).await?;
-        Ok(())
+    fn reader(&self) -> LogReader {
+        LogReader{
+            log: self.log.clone(),
+            label: self.label,
+            cursor: LogCursor::new(),
+        }
     }
-}
 
-impl LogServicer {
-    // run in the background and pull data off of the pipe
-    async fn run(&mut self) -> Result<()> {
+    async fn feed_from(mut r_pipe: PipeRead, log: Arc<Mutex<ByteLog>>) -> Result<()> {
         let mut buf = vec![0u8; 16*1024];
         loop {
-            let n = self.r_pipe.read(&mut buf).await?;
+            let n = r_pipe.read(&mut buf).await?;
             if n == 0 {
                 return Ok(());
             }
 
-            self.log.lock().unwrap().append(&buf[..n]);
+            log.lock().unwrap().append(&buf[..n]);
         }
+    }
+
+    async fn stop(self) {
+        self.feed_task.abort();
+        _ = self.feed_task.await;
     }
 }
 
+struct LogReader {
+    log: Arc<Mutex<ByteLog>>,
+    label: SubStreamLabel,
+    cursor: LogCursor,
+}
+
 impl LogReader {
-    fn read(&self, cursor: &mut LogCursor, buf: &mut [u8]) -> usize {
-       self.log.lock().unwrap().read(cursor, buf)
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+       self.log.lock().unwrap().read(&mut self.cursor, buf)
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.log.lock().unwrap().len()
     }
 
-    async fn write_all<W: AsyncWrite + Unpin>(&self, cursor: &mut LogCursor, writer: &mut W) -> Result<()> {
+    async fn stream<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<()> {
         let mut buf = vec![0u8; 4096];
         loop {
-            let nread = self.read(cursor, &mut buf);
+            let nread = self.read(&mut buf);
             if nread == 0 {
                 break;
             }
-            writer.write_all(&buf[..nread]).await?;
+
+            enclaver::enclave_log::write(writer, self.label, &buf[..nread]).await?;
         }
 
         Ok(())
     }
 
-    async fn stream<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        let mut cursor = LogCursor::new();
-        let mut w = self.log.lock().unwrap().watch();
-        loop {
-            self.write_all(&mut cursor, writer).await?;
+    fn watch(&self) -> watch::Receiver<()> {
+        self.log.lock().unwrap().watch()
+    }
 
-            // wait for new data
-            // unwrap() since the sender never closes first
-            w.changed().await.unwrap();
-        }
+    async fn changed<T>(mut rx: watch::Receiver<()>, cookie: T) -> (watch::Receiver<()>, T) {
+        rx.changed().await.unwrap();
+        (rx, cookie)
     }
 }
 
 pub struct AppLog {
-    servicer: LogServicer,
-    reader: LogReader,
+    substreams: Vec<SubStream>,
 }
 
 impl AppLog {
-    pub fn with_stdio_redirect() -> Result<Self> {
-        let (w, s, r) = new_app_log()?;
-        w.redirect_stdio()?;
+    pub fn new() -> Self {
+        Self{
+            substreams: Vec::new(),
+        }
+    }
 
-        Ok(Self{
-            servicer: s,
-            reader: r,
-        })
+    pub fn add_substream(&mut self, r_pipe: PipeRead, label: SubStreamLabel) {
+        self.substreams.push(SubStream::new(r_pipe, label));
     }
 
     // serve the log over vsock
-    async fn serve_log(incoming: impl Stream<Item=VsockStream>, lr: LogReader) -> Result<()> {
+    async fn serve_log(self, incoming: impl Stream<Item=VsockStream>) -> Result<()> {
         use futures::stream::StreamExt;
 
         let mut incoming = Box::pin(incoming);
-        while let Some(mut sock) = incoming.next().await {
-            // TODO: get rid of detached tasks
-            let lr = lr.clone();
+        while let Some(sock) = incoming.next().await {
+            let readers = self.substreams.iter()
+                .map(SubStream::reader)
+                .collect();
+
             tokio::task::spawn(async move {
-                // if send fails, remote side probably hung up, no need to do anything.
-                _ = lr.stream(&mut sock).await;
+                serve_conn(sock, readers).await
             });
         }
 
@@ -241,146 +228,40 @@ impl AppLog {
     }
 
     // launch a task to service the pipe and serve the log over vsock
-    pub fn start_serving(mut self, port: u32) -> JoinHandle<Result<()>> {
+    pub fn start_serving(self, port: u32) -> JoinHandle<Result<()>> {
         match enclaver::vsock::serve(port) {
             Ok(incoming) => {
                 tokio::task::spawn(async move {
-                    tokio::try_join!(self.servicer.run(), AppLog::serve_log(incoming, self.reader))?;
+                    self.serve_log(incoming).await?;
                     Ok(())
                 })
             },
             Err(e) => tokio::task::spawn(async move { Err(e) }),
         }
     }
-}
 
-
-enum EntrypointStatus {
-    Running,
-    Exited(ExitStatus),
-    Fatal(String),
-}
-
-impl EntrypointStatus {
-    fn as_json(&self) -> String {
-        match self {
-            Self::Running => "{ \"status\": \"running\" }\n".to_string(),
-            Self::Exited(exit_status) => {
-                match exit_status {
-                    ExitStatus::Exited(code) => format!("{{ \"status\": \"exited\", \"code\": {code} }}\n"),
-                    ExitStatus::Signaled(sig) => format!("{{ \"status\": \"signaled\", \"signal\": \"{sig}\" }}\n"),
-                }
-            },
-            Self::Fatal(err) => format!("{{ \"status\": \"fatal\", \"error\": \"{err}\" }}\n"),
+    pub async fn stop(self) {
+        for ss in self.substreams {
+            ss.stop().await;
         }
     }
 }
 
-struct AppStatusInner {
-    status: EntrypointStatus,
-    watches: WatchSet,
-}
+async fn serve_conn(mut sock: VsockStream, mut readers: Vec<LogReader>) {
+    let mut changed: FuturesUnordered<_> =
+        readers.iter_mut()
+            .map(|r| r.watch())
+            .enumerate()
+            .map(|(i, rx)| LogReader::changed(rx, i))
+            .collect();
 
-impl AppStatusInner {
-    fn new() -> Self {
-        Self{
-            status: EntrypointStatus::Running,
-            watches: WatchSet::new(),
+    use futures::stream::StreamExt;
+
+    while let Some((rx, i)) = changed.next().await {
+        if let Err(_) = readers[i].stream(&mut sock).await {
+            break;
         }
-    }
-
-    fn exited(&mut self, status: ExitStatus) {
-        self.status = EntrypointStatus::Exited(status);
-        self.watches.notify();
-    }
-
-    fn fatal(&mut self, err: String) {
-        self.status = EntrypointStatus::Fatal(err);
-        self.watches.notify();
-    }
-}
-
-#[derive(Clone)]
-pub struct AppStatus {
-    inner: Arc<Mutex<AppStatusInner>>,
-}
-
-impl AppStatus {
-    pub fn new() -> Self {
-        Self{
-            inner: Arc::new(Mutex::new(AppStatusInner::new())),
-        }
-    }
-
-    pub fn exited(&self, status: ExitStatus) {
-        self.inner.lock().unwrap().exited(status);
-    }
-
-    pub fn fatal(&self, err: String) {
-        self.inner.lock().unwrap().fatal(err);
-    }
-
-    pub fn start_serving(&self, port: u32) -> JoinHandle<Result<()>> {
-        use futures::stream::StreamExt;
-
-        match enclaver::vsock::serve(port) {
-            Ok(incoming) => {
-                let mut incoming = Box::pin(incoming);
-                let app_status = self.clone();
-                tokio::task::spawn(async move {
-                    while let Some(sock) = incoming.next().await {
-                        let app_status = app_status.clone();
-                        tokio::task::spawn(async move {
-                            app_status.stream(sock).await;
-                        });
-                    }
-                    Ok(())
-                })
-            },
-            Err(e) => tokio::task::spawn(async move { Err(e) })
-        }
-    }
-
-    async fn stream(&self, mut sock: VsockStream) {
-        let mut w = self.inner.lock().unwrap().watches.add();
-
-        loop {
-            let json_str = self.inner.lock().unwrap().status.as_json();
-            _ = sock.write_all(json_str.as_bytes()).await;
-
-            // wait for new data
-            // unwrap() since the sender never closes first
-            w.changed().await.unwrap();
-        }
-    }
-}
-
-// Broadcast mechanism that something being watched has changed
-struct WatchSet {
-    watches: Vec<Sender<()>>,
-}
-
-impl WatchSet {
-    fn new() -> Self {
-        Self{
-            watches: Vec::new(),
-        }
-    }
-
-    fn add(&mut self) -> Receiver<()> {
-        let (tx, rx) = tokio::sync::watch::channel(());
-        self.watches.push(tx);
-        rx
-    }
-
-    fn notify(&mut self) {
-        // first, clean up any closed channels
-        self.watches.retain(|s| !s.is_closed());
-
-        // now notify
-        for w in &self.watches {
-            _ = w.send(())
-        }
+        changed.push(LogReader::changed(rx, i));
     }
 }
 
@@ -503,62 +384,5 @@ mod tests {
 
         let tail_pos = expected.len() - actual.len();
         assert!(actual == expected[tail_pos..]);
-    }
-
-    async fn read_json<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Result<JsonValue> {
-        let line = lines.next_line()
-            .await?
-            .ok_or(anyhow!("unexpected EOF"))?;
-
-        Ok(json::parse(&line)?)
-    }
-
-    async fn app_status_lines() -> Result<Lines<impl AsyncBufRead + Unpin>> {
-        let sock = VsockStream::connect(enclaver::vsock::VMADDR_CID_HOST, STATUS_PORT).await?;
-        // bug in VsockStream::connect: it can return Ok even if connect failed
-        _ = sock.peer_addr()?;
-        Ok(BufReader::new(sock).lines())
-    }
-
-    #[tokio::test]
-    async fn test_app_status() {
-        let app_status = super::AppStatus::new();
-        let status_task = app_status.start_serving(STATUS_PORT);
-
-        let mut client1 = app_status_lines().await.unwrap();
-        let mut client2 = app_status_lines().await.unwrap();
-
-        // Running
-        let mut expected = object!{ status: "running" };
-
-        let mut status = read_json(&mut client1).await.unwrap();
-
-        assert!(status == expected);
-
-        status = read_json(&mut client2).await.unwrap();
-        assert!(status == expected);
-
-        // Exited
-        app_status.exited(ExitStatus::Exited(2));
-        expected = object!{ status: "exited", code: 2 };
-
-        status = read_json(&mut client1).await.unwrap();
-        assert!(status == expected);
-
-        status = read_json(&mut client2).await.unwrap();
-        assert!(status == expected);
-
-        // Signaled
-        app_status.exited(ExitStatus::Signaled(Signal::SIGTERM));
-        expected = object!{ status: "signaled", signal: "SIGTERM" };
-
-        status = read_json(&mut client1).await.unwrap();
-        assert!(status == expected);
-
-        status = read_json(&mut client2).await.unwrap();
-        assert!(status == expected);
-
-        status_task.abort();
-        _ = status_task.await;
     }
 }

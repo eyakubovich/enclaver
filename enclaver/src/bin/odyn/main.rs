@@ -1,6 +1,7 @@
 pub mod config;
 pub mod enclave;
 pub mod console;
+pub mod status;
 pub mod launcher;
 pub mod ingress;
 pub mod egress;
@@ -14,8 +15,10 @@ use anyhow::{Result};
 
 use enclaver::constants::{APP_LOG_PORT, STATUS_PORT};
 use enclaver::nsm::Nsm;
+use enclaver::enclave_log::SubStreamLabel;
 
-use console::{AppLog, AppStatus};
+use console::{AppLog};
+use status::AppStatus;
 use config::Configuration;
 use ingress::IngressService;
 use egress::EgressService;
@@ -66,6 +69,20 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     Ok(exit_status)
 }
 
+fn start_logging() -> tokio::task::JoinHandle<Result<()>> {
+    let (r, w) = tokio_pipe::pipe().unwrap();
+
+    use std::os::unix::io::AsRawFd;
+
+    nix::unistd::dup2(w.as_raw_fd(), std::io::stdout().as_raw_fd()).unwrap();
+    nix::unistd::dup2(w.as_raw_fd(), std::io::stderr().as_raw_fd()).unwrap();
+
+    let mut log = AppLog::new();
+    log.add_substream(r, SubStreamLabel::Supervisor);
+
+    log.start_serving(APP_LOG_PORT)
+}
+
 async fn run(args: &CliArgs) -> Result<()> {
     // Start the status and logs listeners ASAP so that if we fail to
     // initialize, we can communicate the status and stream the logs
@@ -74,8 +91,7 @@ async fn run(args: &CliArgs) -> Result<()> {
 
     let mut console_task = None;
     if !args.no_console {
-        let app_log = AppLog::with_stdio_redirect()?;
-        console_task = Some(app_log.start_serving(APP_LOG_PORT));
+        console_task = Some(start_logging())
     }
 
     match launch(args).await {
